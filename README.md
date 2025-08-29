@@ -1,27 +1,27 @@
 
-# 던파M 갤 동향 슬랙 봇 (GitHub Actions 템플릿)
+# 던파M 커뮤니티 동향 슬랙 봇 (Patched)
 
-매일 **오전 9시(KST)**, 던전앤파이터 모바일 마이너 갤러리의 지난 24시간 동향을 요약해 **슬랙 채널**로 보내는 봇입니다.
+DCInside + Arca Live(아카라이브) 던파M 채널을 통합 수집해 **매일 09:00(KST)** 슬랙으로 요약을 발송합니다.
 
-## 빠른 시작
+## 무엇이 바뀌었나요?
+- **부분 실패 허용**: Arca 수집 실패 시에도 DCInside 결과는 전송됩니다.
+- **헤더 강화**: 브라우저 유사 헤더/리퍼러 적용 → 보호 페이지에 덜 걸림.
+- **토글/진단 변수**: `ARCA_ENABLED`, `HOURS`, `REQUEST_INTERVAL_SEC` 등 환경변수로 조정.
+- **로그 가독성** 향상.
 
-1. 이 리포지토리(또는 ZIP)를 깃허브에 업로드
-2. Slack에서 Incoming Webhook URL 발급 → 리포지토리 **Settings → Secrets → Actions**에 `SLACK_WEBHOOK_URL` 추가
-3. (선택) 봇 토큰 방식: `SLACK_BOT_TOKEN`, `SLACK_CHANNEL` 추가
-4. 리포지토리 **Actions**에서 워크플로우 수동 실행으로 테스트 → 이후 매일 09:00 KST 자동 실행
+## 빠른 적용 방법
+1. 이 ZIP의 파일로 리포지토리의 **동명 파일을 교체 후 커밋**합니다.
+2. 리포지토리 **Settings → Secrets and variables → Actions**
+   - Secrets: `SLACK_WEBHOOK_URL` (또는 `SLACK_BOT_TOKEN` + `SLACK_CHANNEL`)
+   - Variables(변수): 필요시 아래 추가
+     - `ARCA_ENABLED` = `1` (문제시 `0`으로 끄기)
+     - `HOURS` = `24` (테스트시 36 등)
+     - `REQUEST_INTERVAL_SEC` = `1.5` (문제시 늘려보기)
+     - `ARCA_DETAIL_LIMIT` = `20` (본문 조회 상한)
+3. **Actions → Daily DNFM Digest → Run workflow**로 수동 테스트.
+4. 정상 도착 확인 후, 매일 09:00 KST 자동 발송됩니다.
 
-## 파일 구성
+## 참고
+- DCInside 던파M 목록 구조는 표 기반이며(번호/제목/작성일/조회/추천), 본 파서가 이를 사용합니다.
+- 아카라이브 던파M 목록 및 개별 글 페이지에는 작성일/조회/추천 메타가 노출되어 파싱에 활용됩니다.
 
-```
-.
-├─ app.py                  # 메인 스크립트
-├─ requirements.txt        # 의존성
-└─ .github/
-   └─ workflows/
-      └─ daily.yml         # 스케줄 설정 (00:00 UTC = 09:00 KST)
-```
-
-## 주의사항
-- 사이트 정책(robots.txt, 약관)을 준수하세요. 마크업 변경 시 `parse_list()` 수정 필요.
-- 과도한 요청을 피하세요(요청 간격/페이지 제한 코드 반영).
-- 깃허브 액션스의 `cron`은 **UTC 기준**입니다.

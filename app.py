@@ -1,4 +1,4 @@
-# app.py — DCInside + Arca Live 통합 요약 봇
+# app.py — DCInside + Arca Live 통합 요약 봇 (patched)
 import os
 import re
 import time
@@ -6,7 +6,7 @@ import html
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from collections import Counter, defaultdict
+from collections import Counter
 from urllib.parse import urljoin
 
 import requests
@@ -14,13 +14,22 @@ from bs4 import BeautifulSoup
 
 # ---------------- 공통 설정 ----------------
 KST = timezone(timedelta(hours=9))
-USER_AGENT = "Mozilla/5.0 (compatible; dnfm-slack-bot/2.0; +https://example.com/bot)"
-HEADERS = {"User-Agent": USER_AGENT}
+# 브라우저 유사 헤더 (아카라이브 보호 페이지 회피 확률↑)
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://arca.live/",
+}
 
 # 속도/예의
-REQUEST_INTERVAL_SEC = 1.2  # 요청 간 대기 (사이트 배려)
-MAX_PAGES_DC = 10           # DCInside 목록 페이지 최대 순회
-MAX_LINKS_ARCA = 120        # Arca 목록에서 최대 글 링크 수집(과도 방지)
+REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC", "1.2"))
+MAX_PAGES_DC = int(os.getenv("MAX_PAGES_DC", "10"))
+MAX_LINKS_ARCA = int(os.getenv("MAX_LINKS_ARCA", "120"))
 
 # ---------------- 소스: DCInside ----------------
 DC_GALLERY_URL = "https://gall.dcinside.com/mgallery/board/lists/?id=dnfm"
@@ -32,10 +41,12 @@ ARCA_BASE_URL = "https://arca.live"
 
 # ---------------- 분석 설정 ----------------
 HANGUL_TOKEN = re.compile(r"[가-힣]{2,}")
-STOPWORDS = set("""
-그리고 그러나 그래서 또는 이런 저런 같은 해당 우리 당신 여러분 그냥 매우 너무 좀 진짜 거의 또한 또 더 좀더
-오늘 어제 내일 이번 지난 다음 지금 지금은 조금 많이 대한 관련 관련해 관련한 대해서 등 등등
-""".split())
+STOPWORDS = set(
+    """
+    그리고 그러나 그래서 또는 이런 저런 같은 해당 우리 당신 여러분 그냥 매우 너무 좀 진짜 거의 또한 또 더 좀더
+    오늘 어제 내일 이번 지난 다음 지금 지금은 조금 많이 대한 관련 관련해 관련한 대해서 등 등등
+    """.split()
+)
 
 ISSUE_BUCKETS = {
     "장비·강화": ["강화", "16강", "연마", "장비변환", "돌파", "보장", "악세", "방어구"],
@@ -49,12 +60,15 @@ ISSUE_BUCKETS = {
 WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 # ---------------- 유틸 ----------------
+
 def clean_text(s: str) -> str:
     return html.unescape(re.sub(r"\s+", " ", s)).strip()
+
 
 def tokenize_korean(text: str):
     tokens = [t for t in HANGUL_TOKEN.findall(text)]
     return [t for t in tokens if t not in STOPWORDS and len(t) >= 2]
+
 
 def bucket_issues(tokens):
     counts = Counter(tokens)
@@ -65,8 +79,8 @@ def bucket_issues(tokens):
             result[bucket] = score
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
+
 def parse_time_like_dc(raw: str) -> datetime:
-    """DCInside 목록의 작성일 파싱"""
     raw = raw.strip()
     now_kst = datetime.now(KST)
     if ":" in raw:
@@ -89,12 +103,14 @@ def parse_time_like_dc(raw: str) -> datetime:
     return now_kst - timedelta(days=365)
 
 # ---------------- DCInside 수집 ----------------
+
 def dc_fetch_page(page: int):
     url = f"{DC_GALLERY_URL}&page={page}" if page > 1 else DC_GALLERY_URL
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     time.sleep(REQUEST_INTERVAL_SEC)
     return r.text
+
 
 def dc_parse_list(html_text: str):
     soup = BeautifulSoup(html_text, "lxml")
@@ -127,8 +143,9 @@ def dc_parse_list(html_text: str):
         })
     return rows
 
-def dc_fetch_last_24h():
-    cutoff = datetime.now(KST) - timedelta(hours=24)
+
+def dc_fetch_last_24h(hours=24):
+    cutoff = datetime.now(KST) - timedelta(hours=hours)
     all_posts = []
     for page in range(1, MAX_PAGES_DC + 1):
         try:
@@ -148,26 +165,30 @@ def dc_fetch_last_24h():
                 any_new = True
         if not any_new and min_dt and min_dt < cutoff:
             break
-    # dedupe by link
     uniq = {p["link"]: p for p in all_posts if p.get("link")}
     return list(uniq.values())
 
 # ---------------- Arca Live 수집 ----------------
-# 참고: 아카라이브 목록/글 페이지 예시(작성일/조회수/추천 등 메타 노출)  cite: turn13search30, turn13search44
 
-ARCA_DATE_RX1 = re.compile(r"(\d{4}).\-.\-")     # 2025.02.17 또는 2025-02-17
-ARCA_DATE_RX2 = re.compile(r"(\d{2}):(\d{2})")                     # HH:MM
+ARCA_DATE_RX1 = re.compile(r"(\d{4})[.\-](\d{2})[.\-](\d{2})")
+ARCA_DATE_RX2 = re.compile(r"(\d{2}):(\d{2})")
 ARCA_VIEWS_RX = re.compile(r"조회수\s*([0-9,]+)")
 ARCA_UP_RX    = re.compile(r"추천\s*([\-0-9,]+)")
+ARCA_POST_DATETIME_RX = re.compile(r"(\d{4})[.\-](\d{2})[.\-](\d{2})\s+(\d{2}):(\d{2}):(\d{2})")
+
 
 def arca_fetch(url: str):
     r = requests.get(url, headers=HEADERS, timeout=20)
     r.raise_for_status()
     time.sleep(REQUEST_INTERVAL_SEC)
-    return r.text
+    text = r.text
+    # 보호/차단 페이지 휴리스틱 탐지
+    if any(x in text for x in ["Checking your browser", "cf-challenge", "Please enable JavaScript"]):
+        logging.warning("[Arca] 보호 페이지 감지: 파싱 품질 저하 가능")
+    return text
+
 
 def arca_parse_list(html_text: str):
-    """목록에서 글 링크와 주변 텍스트 메타를 느슨하게 추출"""
     soup = BeautifulSoup(html_text, "lxml")
     anchors = soup.select('a[href^="/b/mobiledf/"]')
     seen = set()
@@ -184,10 +205,9 @@ def arca_parse_list(html_text: str):
         title = clean_text(a.get_text())
         link = urljoin(ARCA_BASE_URL, href)
 
-        # 행 텍스트에서 날짜/조회/추천 대략 추출 (페이지 구조 변경에 강인)
-        parent = a.find_parent(["tr","div","li"]) or a.parent
+        parent = a.find_parent(["tr", "div", "li"]) or a.parent
         row_text = clean_text(parent.get_text(" ")) if parent else ""
-        # 날짜
+
         dt = None
         m1 = ARCA_DATE_RX1.search(row_text)
         if m1:
@@ -197,9 +217,9 @@ def arca_parse_list(html_text: str):
             m2 = ARCA_DATE_RX2.search(row_text)
             if m2:
                 now = datetime.now(KST)
-                h, m = map(int, m2.groups())
-                dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-        # 조회/추천 (없으면 0)
+                h, mi = map(int, m2.groups())
+                dt = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+
         views = 0
         up = 0
         vm = ARCA_VIEWS_RX.search(row_text)
@@ -215,11 +235,11 @@ def arca_parse_list(html_text: str):
         items.append({
             "source": "Arca",
             "no": post_id,
-            "category": "",  # 아카라이브는 말머리 대신 채널/태그 중심이라 빈 값
+            "category": "",
             "title": title,
             "link": link,
-            "author": "",    # 필요시 글 페이지 추가 파싱
-            "dt": dt,        # 없으면 나중에 보충
+            "author": "",
+            "dt": dt,
             "views": views,
             "up": up,
         })
@@ -227,23 +247,17 @@ def arca_parse_list(html_text: str):
             break
     return items
 
-ARCA_POST_DATETIME_RX = re.compile(
-    r"(\d{4}).\-.\-\s+(\d{2}):(\d{2}):(\d{2})"
-)
 
 def arca_fill_detail(item):
-    """목록에서 못 얻은 작성일/조회/추천을 글 페이지에서 보충 (최소 호출)"""
     try:
         html_text = arca_fetch(item["link"])
     except Exception as e:
         logging.warning(f"[Arca] 본문 요청 실패: {e}")
         return item
-    # 작성일
     m = ARCA_POST_DATETIME_RX.search(html_text)
     if m:
         y, M, d, hh, mm, ss = map(int, m.groups())
         item["dt"] = datetime(y, M, d, hh, mm, ss, tzinfo=KST)
-    # 조회/추천
     vm = ARCA_VIEWS_RX.search(html_text)
     if vm:
         item["views"] = int(vm.group(1).replace(",", ""))
@@ -254,39 +268,55 @@ def arca_fill_detail(item):
         except Exception:
             pass
     return item
-def arca_fetch_last_24h():
-    cutoff = datetime.now(KST) - timedelta(hours=24)
+
+
+def arca_fetch_last_24h(hours=24):
+    cutoff = datetime.now(KST) - timedelta(hours=hours)
     html_text = arca_fetch(ARCA_BOARD_URL)
     items = arca_parse_list(html_text)
-    # 목록에서 dt를 못 얻은 항목만 본문을 최대 N개 보충 (과도한 요청 방지)
+
     missing = [it for it in items if not it.get("dt")]
-    to_fill = missing[:30]  # 상위 30개만 본문 조회
+    to_fill = missing[:int(os.getenv("ARCA_DETAIL_LIMIT", "30"))]
     for it in to_fill:
         arca_fill_detail(it)
 
-    # 24시간 내 항목만 선별
     result = []
     for it in items:
         if it.get("dt") and it["dt"] >= cutoff:
             result.append(it)
-    # dedupe by link
     uniq = {p["link"]: p for p in result if p.get("link")}
     return list(uniq.values())
 
 # ---------------- 통합 수집 ----------------
+
 def fetch_all_sources_last_24h():
-    dc = dc_fetch_last_24h()
-    arca = arca_fetch_last_24h()
-    return dc + arca
+    hours = int(os.getenv("HOURS", "24"))
+    results = []
+    # DCInside는 항상 시도
+    try:
+        results.extend(dc_fetch_last_24h(hours=hours))
+    except Exception:
+        logging.exception("[DC] 수집 실패")
+
+    # Arca는 토글 가능
+    if os.getenv("ARCA_ENABLED", "1") == "1":
+        try:
+            results.extend(arca_fetch_last_24h(hours=hours))
+        except Exception:
+            logging.exception("[Arca] 수집 실패")
+
+    return results
 
 # ---------------- 요약/슬랙 ----------------
+
 def build_summary(posts):
     now = datetime.now(KST)
     weekday = WEEKDAY_KR[now.weekday()]
     title_text = f"*던파M 커뮤니티 동향 요약* — {now.strftime('%Y-%m-%d')} ({weekday}) 09:00 KST 기준"
 
-    # 출처 링크
-    context_links = f"<{DC_GALLERY_URL}|DCInside 던파M> · <{ARCA_BOARD_URL}|Arca 던파M>"
+    context_links = (
+        f"<{DC_GALLERY_URL}|DCInside 던파M> · <{ARCA_BOARD_URL}|Arca 던파M>"
+    )
 
     if not posts:
         return {
@@ -295,10 +325,10 @@ def build_summary(posts):
                 {"type": "section", "text": {"type": "mrkdwn", "text": title_text}},
                 {"type": "context", "elements": [{"type": "mrkdwn", "text": context_links + " · 지난 24시간"}]},
                 {"type": "section", "text": {"type": "mrkdwn", "text": ":warning: 수집 결과가 비어 있습니다."}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": "진단 팁: Actions 로그 확인 · 환경변수 HOURS/ARCA_ENABLED 조정 · 요청 간격 증가"}]},
             ],
         }
 
-    # 말머리(DC) / 소스(DC/Arca) 분포
     by_cat = Counter((p.get("category") or "기타") for p in posts if p["source"] == "DCInside")
     by_src = Counter(p["source"] for p in posts)
     total = len(posts)
@@ -310,12 +340,14 @@ def build_summary(posts):
     issue_scores = bucket_issues(tokens)
     top_issues = list(issue_scores.items())[:5]
 
-    # 인기 글 Top 5 (조회, 추천 보조)
     top_posts = sorted(posts, key=lambda x: (x.get("views", 0), x.get("up", 0)), reverse=True)[:5]
 
-    def mk_list(lines): return "\n".join(lines)
+    def mk_list(lines):
+        return "\n".join(lines)
 
-    cat_lines = [f"- *{cat}*: {cnt}개 ({cnt/(sum(by_cat.values()) or 1)*100:.1f}%)" for cat, cnt in by_cat.most_common()]
+    cat_lines = [
+        f"- *{cat}*: {cnt}개 ({cnt/(sum(by_cat.values()) or 1)*100:.1f}%)" for cat, cnt in by_cat.most_common()
+    ]
     src_lines = [f"- *{src}*: {cnt}개 ({cnt/total*100:.1f}%)" for src, cnt in by_src.most_common()]
     kw_lines = [f"*{k}* ({c})" for k, c in top_keywords]
     iss_lines = [f"- *{k}*: {v}" for k, v in top_issues]
@@ -342,14 +374,19 @@ def build_summary(posts):
     ]
     return {"text": text_fallback, "blocks": blocks}
 
+
 def post_to_slack(payload):
     webhook = os.getenv("SLACK_WEBHOOK_URL")
     bot_token = os.getenv("SLACK_BOT_TOKEN")
     channel = os.getenv("SLACK_CHANNEL")
 
     if webhook:
-        r = requests.post(webhook, data=json.dumps(payload),
-                          headers={"Content-Type": "application/json"}, timeout=15)
+        r = requests.post(
+            webhook,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=15,
+        )
         if r.status_code >= 300:
             raise RuntimeError(f"Webhook error: {r.status_code} {r.text}")
         return "webhook"
@@ -366,18 +403,22 @@ def post_to_slack(payload):
             raise RuntimeError(f"Slack API error: {data}")
         return "bot"
     else:
-        raise RuntimeError("슬랙 설정이 없습니다. SLACK_WEBHOOK_URL 또는 (SLACK_BOT_TOKEN+SLACK_CHANNEL)을 넣어주세요.")
+        raise RuntimeError(
+            "슬랙 설정이 없습니다. SLACK_WEBHOOK_URL 또는 (SLACK_BOT_TOKEN+SLACK_CHANNEL)을 넣어주세요."
+        )
+
 
 def main():
     logging.basicConfig(level=logging.INFO)
     try:
         posts = fetch_all_sources_last_24h()
     except Exception:
-        logging.exception("수집 중 오류")
+        logging.exception("수집 중 치명 오류")
         posts = []
     summary = build_summary(posts)
     mode = post_to_slack(summary)
     logging.info(f"Slack 전송 완료 ({mode}) — {len(posts)} posts summarized.")
+
 
 if __name__ == "__main__":
     main()
