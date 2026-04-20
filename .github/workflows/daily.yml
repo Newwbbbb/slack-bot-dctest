@@ -17,13 +17,13 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Check Python
-        shell: pwsh
+        shell: powershell
         run: |
           python --version
           python -m pip --version
 
       - name: Install dependencies
-        shell: pwsh
+        shell: powershell
         run: |
           python -m pip install --upgrade pip --trusted-host pypi.org --trusted-host files.pythonhosted.org --trusted-host pypi.python.org
           if (Test-Path requirements.txt) {
@@ -33,7 +33,7 @@ jobs:
           }
 
       - name: Run digest
-        shell: pwsh
+        shell: powershell
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           HOURS: '24'
