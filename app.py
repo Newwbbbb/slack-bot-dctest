@@ -1,26 +1,24 @@
-# app.py — FULL (크롤링 + 분석 + TOP 랭킹)
+# app.py — DCInside ONLY 안정 버전 (분석 + TOP 포함)
 
 import os
 import re
-import time
 import html
 import json
 import logging
-from datetime import datetime, timedelta, timezone
 from collections import Counter
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------- 공통 ----------------
-KST = timezone(timedelta(hours=9))
-
+# ---------------- 설정 ----------------
 DC_GALLERY_URL = "https://gall.dcinside.com/mgallery/board/lists/?id=dnfm"
 DC_BASE_URL = "https://gall.dcinside.com"
 
-ARCA_BOARD_URL = "https://arca.live/b/mobiledf"
-ARCA_BASE_URL = "https://arca.live"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "ko-KR,ko;q=0.9",
+}
 
 HANGUL_TOKEN = re.compile(r"[가-힣]{2,}")
 STOPWORDS = set("그리고 그러나 그래서 또는 이런 저런 같은 해당 우리 당신 여러분 그냥 매우 너무 좀 진짜 거의 또한 또 더".split())
@@ -50,14 +48,24 @@ def bucket_issues(tokens):
             result[k] = score
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
-# ---------------- DC ----------------
+# ---------------- DC 수집 ----------------
 
 def dc_fetch():
-    html_text = requests.get(DC_GALLERY_URL).text
-    soup = BeautifulSoup(html_text, "lxml")
+    try:
+        r = requests.get(DC_GALLERY_URL, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        logging.exception("DC 요청 실패")
+        return []
+
+    soup = BeautifulSoup(r.text, "lxml")
+
+    rows = soup.select("table.gall_list tbody tr")
+    logging.info(f"rows: {len(rows)}")
 
     posts = []
-    for tr in soup.select("table.gall_list tbody tr"):
+
+    for tr in rows:
         if "notice" in str(tr):
             continue
 
@@ -69,59 +77,36 @@ def dc_fetch():
         if not title_el:
             continue
 
-        posts.append({
-            "source": "DC",
-            "category": clean_text(cols[1].get_text()),
-            "title": clean_text(title_el.get_text()),
-            "link": urljoin(DC_BASE_URL, title_el["href"]),
-            "views": int(re.sub(r"\D", "", cols[5].get_text()) or 0),
-            "up": int(re.sub(r"\D", "", cols[6].get_text()) or 0),
-        })
+        try:
+            posts.append({
+                "source": "DC",
+                "category": clean_text(cols[1].get_text()),
+                "title": clean_text(title_el.get_text()),
+                "link": urljoin(DC_BASE_URL, title_el["href"]),
+                "views": int(re.sub(r"\D", "", cols[5].get_text()) or 0),
+                "up": int(re.sub(r"\D", "", cols[6].get_text()) or 0),
+            })
+        except Exception:
+            continue
+
+    logging.info(f"posts: {len(posts)}")
     return posts
 
-# ---------------- Arca ----------------
-
-def arca_fetch():
-    html_text = requests.get(ARCA_BOARD_URL).text
-    soup = BeautifulSoup(html_text, "lxml")
-
-    posts = []
-    for a in soup.select('a[href^="/b/mobiledf/"]')[:50]:
-        posts.append({
-            "source": "Arca",
-            "category": "아카",
-            "title": clean_text(a.get_text()),
-            "link": urljoin(ARCA_BASE_URL, a["href"]),
-            "views": 0,
-            "up": 0,
-        })
-    return posts
-
-# ---------------- 통합 ----------------
-
-def fetch_all():
-    posts = []
-    try:
-        posts += dc_fetch()
-    except:
-        logging.exception("DC 실패")
-
-    try:
-        posts += arca_fetch()
-    except:
-        logging.exception("Arca 실패")
-
-    return posts
-
-# ---------------- 분석 + 요약 ----------------
+# ---------------- 요약 ----------------
 
 def build_summary(posts):
 
-    # 분포
+    if not posts:
+        return {
+            "text": "데이터 없음",
+            "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": ":warning: DC 데이터 수집 실패"}}
+            ],
+        }
+
     by_cat = Counter(p["category"] for p in posts)
     by_src = Counter(p["source"] for p in posts)
 
-    # 키워드
     tokens = []
     for p in posts:
         tokens += tokenize(p["title"])
@@ -129,16 +114,15 @@ def build_summary(posts):
     top_keywords = Counter(tokens).most_common(10)
     issues = bucket_issues(tokens)
 
-    # TOP
     top_posts = sorted(posts, key=lambda x: (x["views"], x["up"]), reverse=True)[:5]
     top_views = sorted(posts, key=lambda x: x["views"], reverse=True)[:5]
     top_up = sorted(posts, key=lambda x: x["up"], reverse=True)[:5]
 
     def fmt(p, i):
-        return f"{i+1}. <{p['link']}|{p['title']}> · {p['source']} · 조회 {p['views']} · 추천 {p['up']}"
+        return f"{i+1}. <{p['link']}|{p['title']}> · 조회 {p['views']} · 추천 {p['up']}"
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "*던파M 커뮤니티 요약*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*던파M DCInside 요약*"}},
         {"type": "divider"},
 
         {"type": "section", "text": {"type": "mrkdwn", "text":
@@ -172,7 +156,7 @@ def build_summary(posts):
         }},
     ]
 
-    return {"text": "요약", "blocks": blocks}
+    return {"text": "DC 요약", "blocks": blocks}
 
 # ---------------- Slack ----------------
 
@@ -189,8 +173,8 @@ def post_to_slack(payload):
 def main():
     logging.basicConfig(level=logging.INFO)
 
-    posts = fetch_all()
-    logging.info(f"{len(posts)} posts 수집")
+    posts = dc_fetch()
+    logging.info(f"수집된 글 수: {len(posts)}")
 
     summary = build_summary(posts)
     post_to_slack(summary)
