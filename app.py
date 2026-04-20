@@ -1,13 +1,20 @@
-# app.py — DCInside ONLY 안정 버전 (GitHub Actions 호환)
-# 주요 수정:
-#  1. 실제 Chrome 수준의 전체 헤더 (Sec-Fetch-*, Accept, Referer 등)
-#  2. requests.Session() 으로 쿠키 유지 + 메인 페이지 선방문
-#  3. 재시도(backoff) + 차단 페이지 감지
-#  4. 진단 로깅 강화 (status, 응답 길이, 본문 일부)
-#  5. 실패 시 Slack에 원인을 함께 전달
-# 회사 SSL 프록시 환경: Python이 Windows 인증서 저장소를 쓰도록 주입
-import truststore
-truststore.inject_into_ssl()
+# app.py — DCInside ONLY 안정 버전 (셀프호스팅 러너 + 회사 네트워크 대응)
+# 주요 특징:
+#  1. truststore 주입 → Windows 인증서 저장소 사용 (회사 SSL 검사 프록시 대응)
+#  2. html.parser 사용 → lxml 의존성 제거 (Python 3.14 빌드 이슈 회피)
+#  3. 실제 Chrome 수준의 전체 헤더
+#  4. requests.Session() + 메인 페이지 워밍업
+#  5. 재시도 + 백오프, 정확한 차단 감지(오탐 방지)
+#  6. 실패 시 Slack에 사유 전달
+
+# === 회사 SSL 프록시 환경에서 Windows 인증서 저장소를 쓰도록 주입 ===
+# 반드시 requests / urllib3 import 전에 호출해야 한다.
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    # truststore 미설치 환경(로컬/리눅스 등)에서는 그냥 넘어감
+    pass
 
 import os
 import re
@@ -86,20 +93,32 @@ def bucket_issues(tokens):
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
 def looks_blocked(text: str) -> bool:
-    """DC 차단/점검/빈 페이지 휴리스틱."""
+    """DC 차단/점검/빈 페이지 휴리스틱.
+
+    정상 DC 페이지도 본문에 'blocked' 같은 단어가 우연히 포함될 수 있어,
+    정상 페이지의 구조적 마커를 먼저 확인하여 오탐을 방지한다.
+    """
     if not text or len(text) < 3000:
         return True
-    lowered = text.lower()
+
+    # 정상 DC 갤러리 페이지면 반드시 포함되는 마커
+    normal_markers = [
+        'class="gall_list"',
+        "gall_list",
+        "dcinside",
+    ]
+    if any(m in text for m in normal_markers):
+        return False  # 정상 페이지로 판정 — 차단 아님
+
+    # 정상 마커가 전혀 없을 때만 차단 문구 검사
     bad_markers = [
         "access denied",
-        "blocked",
-        "cloudflare",
         "잠시 후 다시 시도",
         "접근이 차단",
         "점검 중",
         "비정상적인 접근",
     ]
-    return any(m in text or m in lowered for m in bad_markers)
+    return any(m in text for m in bad_markers)
 
 # ---------------- DC 수집 ----------------
 
@@ -118,8 +137,7 @@ def _warmup(session: requests.Session):
         logging.warning(f"[warmup] 실패 (계속 진행): {e}")
 
 def dc_fetch():
-    """DC 갤러리 수집. 실패 시 (posts, error_reason) 튜플 대신 posts만 반환하고
-    에러 사유는 전역 로거에 남김. 최종 호출부에서 len(posts)로 판단."""
+    """DC 갤러리 수집. 실패 시 빈 리스트 반환, 사유는 DC_FETCH_ERROR 환경변수에 기록."""
     session = _make_session()
     _warmup(session)
 
@@ -179,7 +197,6 @@ def dc_fetch():
             time.sleep(BASE_DELAY * attempt + random.random())
 
     logging.error(f"모든 재시도 실패. 마지막 사유: {last_reason}")
-    # 에러 사유를 환경변수에 저장해서 build_summary에서 노출
     os.environ["DC_FETCH_ERROR"] = last_reason
     return []
 
@@ -190,9 +207,6 @@ def _parse_rows(rows):
         cls = tr.get("class") or []
         if "notice" in cls or "notice" in str(tr.get("class", "")):
             continue
-        if tr.select_one("td.gall_subject") and "공지" in tr.get_text():
-            # 보수적 이중 체크
-            pass
 
         cols = tr.find_all("td")
         if len(cols) < 7:
@@ -231,8 +245,7 @@ def build_summary(posts):
                     "text": f":warning: *DC 데이터 수집 실패*\n사유: `{reason}`"}},
                 {"type": "context", "elements": [
                     {"type": "mrkdwn",
-                     "text": "GitHub Actions 러너 IP가 DCInside에 차단되었을 가능성이 높습니다. "
-                             "셀프호스팅 러너 또는 프록시 사용을 검토하세요."}
+                     "text": "러너 네트워크에서 DCInside 접근을 확인하세요 (방화벽, 프록시, 인증서)."}
                 ]},
             ],
         }
