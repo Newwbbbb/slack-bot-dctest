@@ -1,4 +1,5 @@
 # app.py — DCInside + Arca Live 통합 요약 봇 (patched)
+# 추가: 조회수 TOP 5 / 추천수 TOP 5 별도 표시
 import os
 import re
 import time
@@ -309,6 +310,15 @@ def fetch_all_sources_last_24h():
 
 # ---------------- 요약/슬랙 ----------------
 
+def format_post_line(i: int, p: dict) -> str:
+    """게시글 한 줄 포맷 (조회수/추천수 TOP 리스트 공용)"""
+    return (
+        f"{i+1}. <{p['link']}|{p['title']}> · {p['source']} · "
+        f"조회 {p.get('views', 0):,} · 추천 {p.get('up', 0):,} · "
+        + (p['dt'].astimezone(KST).strftime('%m/%d %H:%M') if p.get('dt') else '')
+    )
+
+
 def build_summary(posts):
     now = datetime.now(KST)
     weekday = WEEKDAY_KR[now.weekday()]
@@ -340,7 +350,9 @@ def build_summary(posts):
     issue_scores = bucket_issues(tokens)
     top_issues = list(issue_scores.items())[:5]
 
-    top_posts = sorted(posts, key=lambda x: (x.get("views", 0), x.get("up", 0)), reverse=True)[:5]
+    # --- 조회수 / 추천수 TOP 5 분리 ---
+    top_by_views = sorted(posts, key=lambda x: x.get("views", 0), reverse=True)[:5]
+    top_by_up    = sorted(posts, key=lambda x: x.get("up", 0),    reverse=True)[:5]
 
     def mk_list(lines):
         return "\n".join(lines)
@@ -351,11 +363,8 @@ def build_summary(posts):
     src_lines = [f"- *{src}*: {cnt}개 ({cnt/total*100:.1f}%)" for src, cnt in by_src.most_common()]
     kw_lines = [f"*{k}* ({c})" for k, c in top_keywords]
     iss_lines = [f"- *{k}*: {v}" for k, v in top_issues]
-    post_lines = [
-        f"{i+1}. <{p['link']}|{p['title']}> · {p['source']} · 조회 {p.get('views',0)} · 추천 {p.get('up',0)} · "
-        + (p['dt'].astimezone(KST).strftime('%m/%d %H:%M') if p.get('dt') else '')
-        for i, p in enumerate(top_posts)
-    ]
+    views_lines = [format_post_line(i, p) for i, p in enumerate(top_by_views)]
+    up_lines    = [format_post_line(i, p) for i, p in enumerate(top_by_up)]
 
     text_fallback = (
         f"총 {total}건 | 출처: " + ", ".join([f"{k}:{v}" for k,v in by_src.most_common()]) +
@@ -370,7 +379,9 @@ def build_summary(posts):
         {"type": "section", "text": {"type": "mrkdwn", "text": "*출처 분포*\n" + mk_list(src_lines)}},
         {"type": "section", "text": {"type": "mrkdwn", "text": "*핵심 키워드 TOP 10*\n" + ", ".join(kw_lines)}},
         {"type": "section", "text": {"type": "mrkdwn", "text": "*이슈 레이더*\n" + (mk_list(iss_lines) if iss_lines else "- 감지된 주요 이슈 없음")}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": "*인기 글 TOP 5*\n" + mk_list(post_lines)}},
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*조회수 TOP 5* :eyes:\n" + (mk_list(views_lines) if views_lines else "- 없음")}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": "*추천수 TOP 5* :+1:\n" + (mk_list(up_lines) if up_lines else "- 없음")}},
     ]
     return {"text": text_fallback, "blocks": blocks}
 
