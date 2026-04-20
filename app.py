@@ -1,8 +1,6 @@
 # app.py — DCInside ONLY (어제 게시글만, KST 기준)
-# 날짜 표시 형식:
-#   - "14:32"       → 오늘 글
-#   - "04.19"       → 올해 다른 날
-#   - "2024.04.19"  → 작년 이전
+# 날짜 형식: "14:32" (오늘) / "04.19" (올해) / "2024.04.19" (작년 이전)
+# 중단 로직: has_seen_yesterday 플래그 기반 (고정글/sticky에 강건)
 
 try:
     import truststore
@@ -70,7 +68,7 @@ ISSUE_BUCKETS = {
 
 MAX_RETRIES = 4
 BASE_DELAY = 2.0
-MAX_PAGES_DC = int(os.getenv("MAX_PAGES_DC", "10"))
+MAX_PAGES_DC = int(os.getenv("MAX_PAGES_DC", "15"))  # 10 → 15로 여유
 REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC", "1.5"))
 
 # ---------------- 유틸 ----------------
@@ -91,7 +89,6 @@ def bucket_issues(tokens):
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
 def get_target_date():
-    """수집 대상 날짜 = KST 기준 어제."""
     now_kst = datetime.now(KST)
     return (now_kst - timedelta(days=1)).date()
 
@@ -102,28 +99,22 @@ def looks_blocked(text: str) -> bool:
     if any(m in text for m in normal_markers):
         return False
     bad_markers = [
-        "access denied",
-        "잠시 후 다시 시도",
-        "접근이 차단",
-        "점검 중",
-        "비정상적인 접근",
+        "access denied", "잠시 후 다시 시도", "접근이 차단",
+        "점검 중", "비정상적인 접근",
     ]
     return any(m in text for m in bad_markers)
 
-# ---------------- 날짜/행 파싱 ----------------
+# ---------------- 날짜 파싱 ----------------
 
-# DC 텍스트 형식 정규식
-RE_TIME_ONLY   = re.compile(r"^\s*(\d{1,2}):(\d{1,2})\s*$")                     # 14:32
-RE_MONTH_DAY   = re.compile(r"^\s*(\d{1,2})\.(\d{1,2})\s*$")                    # 04.19
-RE_YEAR_MD     = re.compile(r"^\s*(\d{4})\.(\d{1,2})\.(\d{1,2})\s*$")           # 2024.04.19
-RE_FULL_TITLE  = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[\sT]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?")  # title 속성용
+RE_TIME_ONLY = re.compile(r"^\s*(\d{1,2}):(\d{1,2})\s*$")
+RE_MONTH_DAY = re.compile(r"^\s*(\d{1,2})\.(\d{1,2})\s*$")
+RE_YEAR_MD   = re.compile(r"^\s*(\d{4})\.(\d{1,2})\.(\d{1,2})\s*$")
+RE_FULL_TITLE = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[\sT]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?")
 
 def _find_date_td(tr):
-    """tr 안에서 날짜 td 찾기 (견고한 다단계)."""
     td = tr.select_one("td.gall_date")
     if td:
         return td
-    # 텍스트가 MM.DD / HH:MM / YYYY.MM.DD 중 하나인 td
     for td in tr.find_all("td"):
         t = clean_text(td.get_text())
         if RE_TIME_ONLY.match(t) or RE_MONTH_DAY.match(t) or RE_YEAR_MD.match(t):
@@ -134,14 +125,12 @@ def _find_date_td(tr):
     return None
 
 def parse_post_datetime(td_date):
-    """td에서 datetime 추출 (KST). 텍스트 우선, title 속성은 보조."""
     if td_date is None:
         return None
 
     now = datetime.now(KST)
     text = clean_text(td_date.get_text())
 
-    # 1) "HH:MM" — 오늘 글
     m = RE_TIME_ONLY.match(text)
     if m:
         try:
@@ -150,20 +139,17 @@ def parse_post_datetime(td_date):
         except ValueError:
             pass
 
-    # 2) "MM.DD" — 올해 다른 날 (★ DC에서 가장 흔한 형식)
     m = RE_MONTH_DAY.match(text)
     if m:
         try:
             mo, d = map(int, m.groups())
             dt = datetime(now.year, mo, d, 12, 0, 0, tzinfo=KST)
-            # 미래면 작년으로 보정 (예: 1월에 "12.30"은 작년)
             if dt.date() > now.date():
                 dt = dt.replace(year=now.year - 1)
             return dt
         except ValueError:
             pass
 
-    # 3) "YYYY.MM.DD" — 작년 이전
     m = RE_YEAR_MD.match(text)
     if m:
         try:
@@ -172,7 +158,6 @@ def parse_post_datetime(td_date):
         except ValueError:
             pass
 
-    # 4) title 속성 fallback (텍스트 파싱 실패 시)
     title = (td_date.get("title") or "").strip()
     if title:
         m = RE_FULL_TITLE.search(title)
@@ -189,27 +174,10 @@ def parse_post_datetime(td_date):
 
     return None
 
-def _debug_dump_first_rows(rows, page, n=3):
-    """첫 n개 행의 구조와 날짜 파싱 결과 로그."""
-    if not rows:
-        return
-    logging.info(f"[DEBUG page {page}] 총 {len(rows)}행 중 상위 {min(n, len(rows))}행 덤프")
-    for idx, tr in enumerate(rows[:n]):
-        cols = tr.find_all("td")
-        td_date = _find_date_td(tr)
-        text = clean_text(td_date.get_text()) if td_date else "(없음)"
-        title = (td_date.get("title") if td_date else "") or ""
-        dt = parse_post_datetime(td_date)
-        cls = " ".join(tr.get("class") or [])
-        logging.info(
-            f"[DEBUG page {page}] row#{idx} trClass='{cls}' tdCount={len(cols)} "
-            f"dateText='{text}' dateTitle='{title[:30]}' parsed={dt}"
-        )
-
 def _parse_row(tr):
-    """단일 tr → (datetime, post dict) 또는 None."""
+    # notice 클래스 외에 추가 고정글 클래스 감지
     cls = tr.get("class") or []
-    if "notice" in cls:
+    if any(c in cls for c in ["notice", "sticky", "adv-tbl", "gall_notice"]):
         return None
 
     cols = tr.find_all("td")
@@ -223,6 +191,13 @@ def _parse_row(tr):
     href = title_el.get("href", "")
     if not href:
         return None
+
+    # subject 셀에 '공지', '설문', 'AD' 등 아이콘이 있으면 고정글/광고로 판단
+    subject_cell = cols[1] if len(cols) > 1 else None
+    if subject_cell:
+        subject_text = clean_text(subject_cell.get_text())
+        if subject_text in ("공지", "설문", "AD", "이벤트"):
+            return None
 
     td_date = _find_date_td(tr)
     post_dt = parse_post_datetime(td_date)
@@ -243,6 +218,21 @@ def _parse_row(tr):
         "posted_at": post_dt.isoformat() if post_dt else None,
     }
     return post_dt, post
+
+def _debug_dump_rows(rows, page, n=5):
+    """페이지별 상위 N개 행의 파싱 상세 로그."""
+    if not rows:
+        return
+    for idx, tr in enumerate(rows[:n]):
+        cols = tr.find_all("td")
+        td_date = _find_date_td(tr)
+        text = clean_text(td_date.get_text()) if td_date else "(없음)"
+        dt = parse_post_datetime(td_date)
+        cls = " ".join(tr.get("class") or [])
+        subj = clean_text(cols[1].get_text())[:20] if len(cols) > 1 else ""
+        logging.info(
+            f"[DEBUG p{page} r{idx}] cls='{cls}' subj='{subj}' dateText='{text}' parsed={dt}"
+        )
 
 # ---------------- 수집 ----------------
 
@@ -305,7 +295,7 @@ def _fetch_page_rows(session, page, req_headers):
     return None, last_reason
 
 def dc_fetch():
-    """KST 기준 어제 작성 게시글만 수집."""
+    """KST 기준 어제 작성 게시글만 수집 — has_seen_yesterday 기반 중단."""
     session = _make_session()
     _warmup(session)
 
@@ -313,11 +303,13 @@ def dc_fetch():
     target_date = get_target_date()
     logging.info(f"수집 대상 날짜: {target_date} (KST 어제)")
     logging.info(f"현재 시각(KST): {datetime.now(KST).isoformat()}")
+    logging.info(f"MAX_PAGES_DC={MAX_PAGES_DC}")
 
     collected = []
     last_reason = None
     total_rows = 0
     total_fail = 0
+    has_seen_yesterday = False
 
     for page in range(1, MAX_PAGES_DC + 1):
         rows, reason = _fetch_page_rows(session, page, req_headers)
@@ -330,8 +322,8 @@ def dc_fetch():
             logging.warning(f"page {page} 건너뜀: {reason}")
             break
 
-        if page == 1:
-            _debug_dump_first_rows(rows, page, n=3)
+        # 모든 페이지 상위 5행 디버그 덤프
+        _debug_dump_rows(rows, page, n=5)
 
         page_y = page_o = page_n = page_dnone = 0
 
@@ -357,20 +349,31 @@ def dc_fetch():
                 page_n += 1
 
         logging.info(
-            f"[page {page}] 어제={page_y} 이전={page_o} 이후={page_n} 날짜파싱실패={page_dnone}"
+            f"[page {page}] 어제={page_y} 이전={page_o} 이후={page_n} 파싱실패={page_dnone}"
         )
 
-        # 어제 이전 글이 보이면 종료
-        if page_o > 0:
-            logging.info(f"어제 이전 글 발견 → 종료 (page {page})")
+        # has_seen_yesterday 갱신
+        if page_y > 0:
+            has_seen_yesterday = True
+
+        # 중단 조건 1: 어제 글을 이미 봤는데 현재 페이지엔 0건 → 지나감
+        if has_seen_yesterday and page_y == 0:
+            logging.info(f"어제 글 구간 통과 → 종료 (page {page})")
             break
 
-        # 1페이지에서 전혀 파싱 안 되면 종료
-        if page == 1 and page_y == 0 and page_n == 0 and page_dnone > 0:
-            logging.error("page 1 모든 행 날짜 파싱 실패 → 종료")
+        # 중단 조건 2: 페이지 2+에서 어제 글 0건이고 이전 글만 잔뜩 → 어제는 이미 지남
+        if page >= 2 and page_y == 0 and page_o > 0 and not has_seen_yesterday:
+            logging.warning(
+                f"어제 글 한 번도 못 봤는데 이전 글만 나옴 → 종료 (page {page}). "
+                f"clock 오류 가능성 체크"
+            )
+            break
+
+        # 1페이지에서 모두 파싱 실패면 종료
+        if page == 1 and page_y == 0 and page_n == 0 and page_o == 0 and page_dnone > 0:
+            logging.error("page 1 모든 행 날짜 파싱 실패")
             os.environ["DC_FETCH_ERROR"] = (
-                f"날짜 파싱 전부 실패 ({page_dnone}행). "
-                f"Actions 로그의 [DEBUG page 1] 줄을 확인하세요."
+                f"날짜 파싱 전부 실패. [DEBUG p1 r0] 로그 확인."
             )
             return []
 
