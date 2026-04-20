@@ -1,49 +1,42 @@
 name: Daily Community Digest
-
 on:
   schedule:
     # 매일 09:00 KST = 00:00 UTC
     - cron: '0 0 * * *'
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: daily-digest
   cancel-in-progress: false
-
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, windows, dc-crawler]
     timeout-minutes: 10
-
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
-
       - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
+          if (Test-Path requirements.txt) {
             pip install -r requirements.txt
-          else
+          } else {
             pip install requests beautifulsoup4 lxml
-          fi
-
+          }
       - name: Run digest
+        shell: pwsh
         env:
           # --- Slack 설정 (둘 중 하나만 필수) ---
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           # SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           # SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
-
           # --- 수집 옵션 (기본값으로 동작, 필요시 조정) ---
           HOURS: '24'
           DC_ENABLED: '1'
@@ -51,7 +44,6 @@ jobs:
           REQUEST_INTERVAL_SEC: '1.5'
           MAX_PAGES_DC: '10'
           MAX_LINKS_ARCA: '120'
-
           # 로그 버퍼링 해제 (실시간 로그 확인용)
           PYTHONUNBUFFERED: '1'
         run: python app.py
