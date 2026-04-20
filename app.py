@@ -1,19 +1,17 @@
-# app.py — DCInside ONLY 안정 버전 (셀프호스팅 러너 + 회사 네트워크 대응)
+# app.py — DCInside ONLY (어제 게시글만 수집, KST 기준)
 # 주요 특징:
 #  1. truststore 주입 → Windows 인증서 저장소 사용 (회사 SSL 검사 프록시 대응)
-#  2. html.parser 사용 → lxml 의존성 제거 (Python 3.14 빌드 이슈 회피)
-#  3. 실제 Chrome 수준의 전체 헤더
-#  4. requests.Session() + 메인 페이지 워밍업
-#  5. 재시도 + 백오프, 정확한 차단 감지(오탐 방지)
+#  2. html.parser 사용 → lxml 의존성 제거
+#  3. 실제 Chrome 수준의 전체 헤더 + 세션 + 워밍업
+#  4. 재시도/백오프, 오탐 방지된 차단 감지
+#  5. ★ KST 기준 "어제" 날짜로 페이지네이션하며 필터링
 #  6. 실패 시 Slack에 사유 전달
 
 # === 회사 SSL 프록시 환경에서 Windows 인증서 저장소를 쓰도록 주입 ===
-# 반드시 requests / urllib3 import 전에 호출해야 한다.
 try:
     import truststore
     truststore.inject_into_ssl()
 except ImportError:
-    # truststore 미설치 환경(로컬/리눅스 등)에서는 그냥 넘어감
     pass
 
 import os
@@ -23,6 +21,7 @@ import time
 import random
 import logging
 from collections import Counter
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
 import requests
@@ -33,7 +32,8 @@ DC_GALLERY_URL = "https://gall.dcinside.com/mgallery/board/lists/?id=dnfm"
 DC_BASE_URL = "https://gall.dcinside.com"
 DC_MAIN_URL = "https://www.dcinside.com/"
 
-# 실제 Chrome 122 수준의 헤더 세트
+KST = timezone(timedelta(hours=9))
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -74,6 +74,8 @@ ISSUE_BUCKETS = {
 
 MAX_RETRIES = 4
 BASE_DELAY = 2.0  # seconds
+MAX_PAGES_DC = int(os.getenv("MAX_PAGES_DC", "10"))
+REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC", "1.5"))
 
 # ---------------- 유틸 ----------------
 
@@ -92,25 +94,18 @@ def bucket_issues(tokens):
             result[k] = score
     return dict(sorted(result.items(), key=lambda x: x[1], reverse=True))
 
-def looks_blocked(text: str) -> bool:
-    """DC 차단/점검/빈 페이지 휴리스틱.
+def get_target_date():
+    """수집 대상 날짜 = KST 기준 어제."""
+    now_kst = datetime.now(KST)
+    return (now_kst - timedelta(days=1)).date()
 
-    정상 DC 페이지도 본문에 'blocked' 같은 단어가 우연히 포함될 수 있어,
-    정상 페이지의 구조적 마커를 먼저 확인하여 오탐을 방지한다.
-    """
+def looks_blocked(text: str) -> bool:
+    """DC 차단/점검/빈 페이지 휴리스틱 (오탐 방지)."""
     if not text or len(text) < 3000:
         return True
-
-    # 정상 DC 갤러리 페이지면 반드시 포함되는 마커
-    normal_markers = [
-        'class="gall_list"',
-        "gall_list",
-        "dcinside",
-    ]
+    normal_markers = ['class="gall_list"', "gall_list", "dcinside"]
     if any(m in text for m in normal_markers):
-        return False  # 정상 페이지로 판정 — 차단 아님
-
-    # 정상 마커가 전혀 없을 때만 차단 문구 검사
+        return False
     bad_markers = [
         "access denied",
         "잠시 후 다시 시도",
@@ -120,6 +115,44 @@ def looks_blocked(text: str) -> bool:
     ]
     return any(m in text for m in bad_markers)
 
+def parse_post_datetime(td_date):
+    """td.gall_date의 title 속성 또는 텍스트에서 datetime 추출 (KST)."""
+    if td_date is None:
+        return None
+
+    # 1) title 속성이 가장 정확 — "2026-04-19 14:32:56" 형태
+    title = (td_date.get("title") or "").strip()
+    if title:
+        try:
+            return datetime.strptime(title, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+        except ValueError:
+            pass
+
+    # 2) 텍스트 기반 fallback
+    text = clean_text(td_date.get_text())
+    now = datetime.now(KST)
+
+    # "HH:MM" — 오늘 작성
+    if re.match(r"^\d{2}:\d{2}$", text):
+        try:
+            h, m = map(int, text.split(":"))
+            return now.replace(hour=h, minute=m, second=0, microsecond=0)
+        except ValueError:
+            pass
+
+    # "MM.DD" — 올해의 다른 날
+    if re.match(r"^\d{2}\.\d{2}$", text):
+        try:
+            mo, d = map(int, text.split("."))
+            dt = datetime(now.year, mo, d, 12, 0, 0, tzinfo=KST)
+            if dt > now:  # 미래면 작년
+                dt = dt.replace(year=now.year - 1)
+            return dt
+        except ValueError:
+            pass
+
+    return None
+
 # ---------------- DC 수집 ----------------
 
 def _make_session() -> requests.Session:
@@ -128,7 +161,6 @@ def _make_session() -> requests.Session:
     return s
 
 def _warmup(session: requests.Session):
-    """메인 페이지를 먼저 방문해서 쿠키 획득."""
     try:
         r = session.get(DC_MAIN_URL, timeout=15)
         logging.info(f"[warmup] status={r.status_code} cookies={len(session.cookies)}")
@@ -136,25 +168,22 @@ def _warmup(session: requests.Session):
     except Exception as e:
         logging.warning(f"[warmup] 실패 (계속 진행): {e}")
 
-def dc_fetch():
-    """DC 갤러리 수집. 실패 시 빈 리스트 반환, 사유는 DC_FETCH_ERROR 환경변수에 기록."""
-    session = _make_session()
-    _warmup(session)
+def _page_url(page: int) -> str:
+    if page <= 1:
+        return DC_GALLERY_URL
+    return f"{DC_GALLERY_URL}&page={page}"
 
-    # 갤러리 요청 시 Referer 지정 (메인에서 들어온 것처럼)
-    req_headers = {"Referer": DC_MAIN_URL}
-
+def _fetch_page_rows(session, page, req_headers):
+    """단일 페이지를 재시도 포함해서 가져오고 tr 리스트 반환. 실패 시 (None, reason)."""
+    url = _page_url(page)
     last_reason = "unknown"
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            r = session.get(DC_GALLERY_URL, headers=req_headers, timeout=20)
+            r = session.get(url, headers=req_headers, timeout=20)
             body_len = len(r.text)
-            logging.info(
-                f"[attempt {attempt}] status={r.status_code} len={body_len}"
-            )
+            logging.info(f"[page {page} attempt {attempt}] status={r.status_code} len={body_len}")
 
-            # 명시적 차단 상태코드
             if r.status_code in (403, 429, 503):
                 last_reason = f"HTTP {r.status_code} (차단/레이트리밋)"
                 logging.warning(last_reason)
@@ -163,86 +192,154 @@ def dc_fetch():
 
             r.raise_for_status()
 
-            # 본문 기반 차단/빈 페이지 감지
             if looks_blocked(r.text):
                 last_reason = f"차단 또는 비정상 응답 (len={body_len})"
                 logging.warning(last_reason)
-                logging.debug("본문 앞부분: %s", r.text[:500])
                 time.sleep(BASE_DELAY * attempt + random.random())
                 continue
 
             soup = BeautifulSoup(r.text, "html.parser")
             rows = soup.select("table.gall_list tbody tr")
-            logging.info(f"rows: {len(rows)}")
+            logging.info(f"[page {page}] rows: {len(rows)}")
 
             if not rows:
-                last_reason = "table.gall_list 행 없음 (셀렉터 변경 가능성)"
+                last_reason = f"page {page}: table.gall_list 행 없음"
                 logging.warning(last_reason)
-                logging.debug("본문 앞부분: %s", r.text[:800])
                 time.sleep(BASE_DELAY * attempt + random.random())
                 continue
 
-            posts = _parse_rows(rows)
-            logging.info(f"posts: {len(posts)}")
-
-            if posts:
-                return posts
-
-            last_reason = "행은 있으나 파싱 결과 0건"
-            logging.warning(last_reason)
+            return rows, None
 
         except requests.RequestException as e:
             last_reason = f"요청 예외: {e!r}"
-            logging.exception(f"[attempt {attempt}] 요청 실패")
+            logging.exception(f"[page {page} attempt {attempt}] 요청 실패")
             time.sleep(BASE_DELAY * attempt + random.random())
 
-    logging.error(f"모든 재시도 실패. 마지막 사유: {last_reason}")
-    os.environ["DC_FETCH_ERROR"] = last_reason
-    return []
+    return None, last_reason
 
-def _parse_rows(rows):
-    posts = []
-    for tr in rows:
-        # 공지 제외
-        cls = tr.get("class") or []
-        if "notice" in cls or "notice" in str(tr.get("class", "")):
-            continue
+def _parse_row(tr):
+    """단일 tr → (datetime, post dict) 또는 None."""
+    cls = tr.get("class") or []
+    if "notice" in cls or "notice" in str(tr.get("class", "")):
+        return None
 
-        cols = tr.find_all("td")
-        if len(cols) < 7:
-            continue
+    cols = tr.find_all("td")
+    if len(cols) < 7:
+        return None
 
-        title_el = cols[2].select_one("a")
-        if not title_el:
-            continue
+    title_el = cols[2].select_one("a")
+    if not title_el:
+        return None
 
-        try:
-            href = title_el.get("href", "")
-            if not href:
+    href = title_el.get("href", "")
+    if not href:
+        return None
+
+    post_dt = parse_post_datetime(cols[4])
+
+    try:
+        post = {
+            "source": "DC",
+            "category": clean_text(cols[1].get_text()),
+            "title": clean_text(title_el.get_text()),
+            "link": urljoin(DC_BASE_URL, href),
+            "views": int(re.sub(r"\D", "", cols[5].get_text()) or 0),
+            "up": int(re.sub(r"\D", "", cols[6].get_text()) or 0),
+            "posted_at": post_dt.isoformat() if post_dt else None,
+        }
+    except Exception:
+        return None
+
+    return post_dt, post
+
+def dc_fetch():
+    """KST 기준 어제 작성 게시글만 수집."""
+    session = _make_session()
+    _warmup(session)
+
+    req_headers = {"Referer": DC_MAIN_URL}
+    target_date = get_target_date()
+    logging.info(f"수집 대상 날짜: {target_date} (KST 기준 어제)")
+
+    collected = []
+    stop = False
+    last_reason = None
+
+    for page in range(1, MAX_PAGES_DC + 1):
+        rows, reason = _fetch_page_rows(session, page, req_headers)
+
+        if rows is None:
+            last_reason = reason
+            # 첫 페이지 실패면 치명적, 그 외엔 지금까지 모은 것 반환
+            if page == 1:
+                os.environ["DC_FETCH_ERROR"] = reason or "page 1 실패"
+                return []
+            logging.warning(f"page {page} 건너뜀: {reason}")
+            break
+
+        # 페이지 내 파싱 + 날짜별 카운트
+        page_yesterday_count = 0
+        page_older_count = 0
+        page_newer_count = 0
+
+        for tr in rows:
+            parsed = _parse_row(tr)
+            if not parsed:
                 continue
-            posts.append({
-                "source": "DC",
-                "category": clean_text(cols[1].get_text()),
-                "title": clean_text(title_el.get_text()),
-                "link": urljoin(DC_BASE_URL, href),
-                "views": int(re.sub(r"\D", "", cols[5].get_text()) or 0),
-                "up": int(re.sub(r"\D", "", cols[6].get_text()) or 0),
-            })
-        except Exception:
-            continue
-    return posts
+            dt, post = parsed
+
+            if dt is None:
+                # 날짜 파싱 실패한 글은 스킵 (공지/비정상 행일 가능성)
+                continue
+
+            d = dt.date()
+            if d == target_date:
+                collected.append(post)
+                page_yesterday_count += 1
+            elif d < target_date:
+                page_older_count += 1
+            else:  # d > target_date (오늘 이후)
+                page_newer_count += 1
+
+        logging.info(
+            f"[page {page}] 어제={page_yesterday_count} "
+            f"이전={page_older_count} 이후={page_newer_count}"
+        )
+
+        # 중단 조건: 이 페이지에 어제보다 더 이전 글이 하나라도 보이면,
+        # 다음 페이지는 확정적으로 더 오래된 글들이므로 멈춘다.
+        if page_older_count > 0:
+            logging.info(f"어제 이전 글 발견 → 페이지네이션 종료 (page {page})")
+            stop = True
+
+        if stop:
+            break
+
+        # 다음 페이지 요청 전 딜레이
+        time.sleep(REQUEST_INTERVAL_SEC)
+
+    logging.info(f"최종 수집: {len(collected)}건 (대상일 {target_date})")
+
+    if not collected and last_reason:
+        os.environ["DC_FETCH_ERROR"] = last_reason
+    elif not collected:
+        os.environ["DC_FETCH_ERROR"] = f"{target_date}에 해당하는 글 없음"
+
+    return collected
 
 # ---------------- 요약 ----------------
 
 def build_summary(posts):
+    target_date = get_target_date()
+    date_str = target_date.strftime("%Y-%m-%d")
 
     if not posts:
         reason = os.environ.get("DC_FETCH_ERROR", "원인 불명")
         return {
-            "text": "DC 수집 실패",
+            "text": f"DC 수집 실패 ({date_str})",
             "blocks": [
                 {"type": "section", "text": {"type": "mrkdwn",
-                    "text": f":warning: *DC 데이터 수집 실패*\n사유: `{reason}`"}},
+                    "text": f":warning: *DC 데이터 수집 실패 ({date_str})*\n사유: `{reason}`"}},
                 {"type": "context", "elements": [
                     {"type": "mrkdwn",
                      "text": "러너 네트워크에서 DCInside 접근을 확인하세요 (방화벽, 프록시, 인증서)."}
@@ -268,7 +365,8 @@ def build_summary(posts):
         return f"{i+1}. <{p['link']}|{p['title']}> · 조회 {p['views']} · 추천 {p['up']}"
 
     blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": "*던파M DCInside 요약*"}},
+        {"type": "section", "text": {"type": "mrkdwn",
+            "text": f"*던파M DCInside 요약 — {date_str}* (총 {len(posts)}건)"}},
         {"type": "divider"},
 
         {"type": "section", "text": {"type": "mrkdwn", "text":
@@ -280,7 +378,7 @@ def build_summary(posts):
         }},
 
         {"type": "section", "text": {"type": "mrkdwn", "text":
-            "*핵심 키워드*\n" + ", ".join(f"{k}({v})" for k, v in top_keywords)
+            "*핵심 키워드*\n" + (", ".join(f"{k}({v})" for k, v in top_keywords) or "(없음)")
         }},
 
         {"type": "section", "text": {"type": "mrkdwn", "text":
@@ -302,7 +400,7 @@ def build_summary(posts):
         }},
     ]
 
-    return {"text": "DC 요약", "blocks": blocks}
+    return {"text": f"DC 요약 — {date_str}", "blocks": blocks}
 
 # ---------------- Slack ----------------
 
