@@ -1,13 +1,9 @@
-# app.py — DCInside ONLY (어제 게시글만 수집, KST 기준)
-# 주요 특징:
-#  1. truststore 주입 → Windows 인증서 저장소 사용 (회사 SSL 검사 프록시 대응)
-#  2. html.parser 사용 → lxml 의존성 제거
-#  3. 실제 Chrome 수준의 전체 헤더 + 세션 + 워밍업
-#  4. 재시도/백오프, 오탐 방지된 차단 감지
-#  5. ★ KST 기준 "어제" 날짜로 페이지네이션하며 필터링
-#  6. 실패 시 Slack에 사유 전달
+# app.py — DCInside ONLY (어제 게시글만, KST 기준)
+# 날짜 표시 형식:
+#   - "14:32"       → 오늘 글
+#   - "04.19"       → 올해 다른 날
+#   - "2024.04.19"  → 작년 이전
 
-# === 회사 SSL 프록시 환경에서 Windows 인증서 저장소를 쓰도록 주입 ===
 try:
     import truststore
     truststore.inject_into_ssl()
@@ -73,7 +69,7 @@ ISSUE_BUCKETS = {
 }
 
 MAX_RETRIES = 4
-BASE_DELAY = 2.0  # seconds
+BASE_DELAY = 2.0
 MAX_PAGES_DC = int(os.getenv("MAX_PAGES_DC", "10"))
 REQUEST_INTERVAL_SEC = float(os.getenv("REQUEST_INTERVAL_SEC", "1.5"))
 
@@ -100,7 +96,6 @@ def get_target_date():
     return (now_kst - timedelta(days=1)).date()
 
 def looks_blocked(text: str) -> bool:
-    """DC 차단/점검/빈 페이지 휴리스틱 (오탐 방지)."""
     if not text or len(text) < 3000:
         return True
     normal_markers = ['class="gall_list"', "gall_list", "dcinside"]
@@ -115,45 +110,141 @@ def looks_blocked(text: str) -> bool:
     ]
     return any(m in text for m in bad_markers)
 
+# ---------------- 날짜/행 파싱 ----------------
+
+# DC 텍스트 형식 정규식
+RE_TIME_ONLY   = re.compile(r"^\s*(\d{1,2}):(\d{1,2})\s*$")                     # 14:32
+RE_MONTH_DAY   = re.compile(r"^\s*(\d{1,2})\.(\d{1,2})\s*$")                    # 04.19
+RE_YEAR_MD     = re.compile(r"^\s*(\d{4})\.(\d{1,2})\.(\d{1,2})\s*$")           # 2024.04.19
+RE_FULL_TITLE  = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[\sT]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?")  # title 속성용
+
+def _find_date_td(tr):
+    """tr 안에서 날짜 td 찾기 (견고한 다단계)."""
+    td = tr.select_one("td.gall_date")
+    if td:
+        return td
+    # 텍스트가 MM.DD / HH:MM / YYYY.MM.DD 중 하나인 td
+    for td in tr.find_all("td"):
+        t = clean_text(td.get_text())
+        if RE_TIME_ONLY.match(t) or RE_MONTH_DAY.match(t) or RE_YEAR_MD.match(t):
+            return td
+    cols = tr.find_all("td")
+    if len(cols) > 4:
+        return cols[4]
+    return None
+
 def parse_post_datetime(td_date):
-    """td.gall_date의 title 속성 또는 텍스트에서 datetime 추출 (KST)."""
+    """td에서 datetime 추출 (KST). 텍스트 우선, title 속성은 보조."""
     if td_date is None:
         return None
 
-    # 1) title 속성이 가장 정확 — "2026-04-19 14:32:56" 형태
-    title = (td_date.get("title") or "").strip()
-    if title:
-        try:
-            return datetime.strptime(title, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-        except ValueError:
-            pass
-
-    # 2) 텍스트 기반 fallback
-    text = clean_text(td_date.get_text())
     now = datetime.now(KST)
+    text = clean_text(td_date.get_text())
 
-    # "HH:MM" — 오늘 작성
-    if re.match(r"^\d{2}:\d{2}$", text):
+    # 1) "HH:MM" — 오늘 글
+    m = RE_TIME_ONLY.match(text)
+    if m:
         try:
-            h, m = map(int, text.split(":"))
-            return now.replace(hour=h, minute=m, second=0, microsecond=0)
+            h, mi = map(int, m.groups())
+            return now.replace(hour=h, minute=mi, second=0, microsecond=0)
         except ValueError:
             pass
 
-    # "MM.DD" — 올해의 다른 날
-    if re.match(r"^\d{2}\.\d{2}$", text):
+    # 2) "MM.DD" — 올해 다른 날 (★ DC에서 가장 흔한 형식)
+    m = RE_MONTH_DAY.match(text)
+    if m:
         try:
-            mo, d = map(int, text.split("."))
+            mo, d = map(int, m.groups())
             dt = datetime(now.year, mo, d, 12, 0, 0, tzinfo=KST)
-            if dt > now:  # 미래면 작년
+            # 미래면 작년으로 보정 (예: 1월에 "12.30"은 작년)
+            if dt.date() > now.date():
                 dt = dt.replace(year=now.year - 1)
             return dt
         except ValueError:
             pass
 
+    # 3) "YYYY.MM.DD" — 작년 이전
+    m = RE_YEAR_MD.match(text)
+    if m:
+        try:
+            y, mo, d = map(int, m.groups())
+            return datetime(y, mo, d, 12, 0, 0, tzinfo=KST)
+        except ValueError:
+            pass
+
+    # 4) title 속성 fallback (텍스트 파싱 실패 시)
+    title = (td_date.get("title") or "").strip()
+    if title:
+        m = RE_FULL_TITLE.search(title)
+        if m:
+            y, mo, d, h, mi, s = m.groups()
+            try:
+                return datetime(
+                    int(y), int(mo), int(d),
+                    int(h or 0), int(mi or 0), int(s or 0),
+                    tzinfo=KST,
+                )
+            except ValueError:
+                pass
+
     return None
 
-# ---------------- DC 수집 ----------------
+def _debug_dump_first_rows(rows, page, n=3):
+    """첫 n개 행의 구조와 날짜 파싱 결과 로그."""
+    if not rows:
+        return
+    logging.info(f"[DEBUG page {page}] 총 {len(rows)}행 중 상위 {min(n, len(rows))}행 덤프")
+    for idx, tr in enumerate(rows[:n]):
+        cols = tr.find_all("td")
+        td_date = _find_date_td(tr)
+        text = clean_text(td_date.get_text()) if td_date else "(없음)"
+        title = (td_date.get("title") if td_date else "") or ""
+        dt = parse_post_datetime(td_date)
+        cls = " ".join(tr.get("class") or [])
+        logging.info(
+            f"[DEBUG page {page}] row#{idx} trClass='{cls}' tdCount={len(cols)} "
+            f"dateText='{text}' dateTitle='{title[:30]}' parsed={dt}"
+        )
+
+def _parse_row(tr):
+    """단일 tr → (datetime, post dict) 또는 None."""
+    cls = tr.get("class") or []
+    if "notice" in cls:
+        return None
+
+    cols = tr.find_all("td")
+    if len(cols) < 5:
+        return None
+
+    title_el = cols[2].select_one("a") if len(cols) > 2 else None
+    if not title_el:
+        return None
+
+    href = title_el.get("href", "")
+    if not href:
+        return None
+
+    td_date = _find_date_td(tr)
+    post_dt = parse_post_datetime(td_date)
+
+    try:
+        views = int(re.sub(r"\D", "", cols[5].get_text()) or 0) if len(cols) > 5 else 0
+        up = int(re.sub(r"\D", "", cols[6].get_text()) or 0) if len(cols) > 6 else 0
+    except Exception:
+        views, up = 0, 0
+
+    post = {
+        "source": "DC",
+        "category": clean_text(cols[1].get_text()) if len(cols) > 1 else "",
+        "title": clean_text(title_el.get_text()),
+        "link": urljoin(DC_BASE_URL, href),
+        "views": views,
+        "up": up,
+        "posted_at": post_dt.isoformat() if post_dt else None,
+    }
+    return post_dt, post
+
+# ---------------- 수집 ----------------
 
 def _make_session() -> requests.Session:
     s = requests.Session()
@@ -174,7 +265,6 @@ def _page_url(page: int) -> str:
     return f"{DC_GALLERY_URL}&page={page}"
 
 def _fetch_page_rows(session, page, req_headers):
-    """단일 페이지를 재시도 포함해서 가져오고 tr 리스트 반환. 실패 시 (None, reason)."""
     url = _page_url(page)
     last_reason = "unknown"
 
@@ -185,16 +275,14 @@ def _fetch_page_rows(session, page, req_headers):
             logging.info(f"[page {page} attempt {attempt}] status={r.status_code} len={body_len}")
 
             if r.status_code in (403, 429, 503):
-                last_reason = f"HTTP {r.status_code} (차단/레이트리밋)"
-                logging.warning(last_reason)
+                last_reason = f"HTTP {r.status_code}"
                 time.sleep(BASE_DELAY * attempt + random.random())
                 continue
 
             r.raise_for_status()
 
             if looks_blocked(r.text):
-                last_reason = f"차단 또는 비정상 응답 (len={body_len})"
-                logging.warning(last_reason)
+                last_reason = f"차단/비정상 응답 (len={body_len})"
                 time.sleep(BASE_DELAY * attempt + random.random())
                 continue
 
@@ -203,8 +291,7 @@ def _fetch_page_rows(session, page, req_headers):
             logging.info(f"[page {page}] rows: {len(rows)}")
 
             if not rows:
-                last_reason = f"page {page}: table.gall_list 행 없음"
-                logging.warning(last_reason)
+                last_reason = f"page {page}: rows 없음"
                 time.sleep(BASE_DELAY * attempt + random.random())
                 continue
 
@@ -217,41 +304,6 @@ def _fetch_page_rows(session, page, req_headers):
 
     return None, last_reason
 
-def _parse_row(tr):
-    """단일 tr → (datetime, post dict) 또는 None."""
-    cls = tr.get("class") or []
-    if "notice" in cls or "notice" in str(tr.get("class", "")):
-        return None
-
-    cols = tr.find_all("td")
-    if len(cols) < 7:
-        return None
-
-    title_el = cols[2].select_one("a")
-    if not title_el:
-        return None
-
-    href = title_el.get("href", "")
-    if not href:
-        return None
-
-    post_dt = parse_post_datetime(cols[4])
-
-    try:
-        post = {
-            "source": "DC",
-            "category": clean_text(cols[1].get_text()),
-            "title": clean_text(title_el.get_text()),
-            "link": urljoin(DC_BASE_URL, href),
-            "views": int(re.sub(r"\D", "", cols[5].get_text()) or 0),
-            "up": int(re.sub(r"\D", "", cols[6].get_text()) or 0),
-            "posted_at": post_dt.isoformat() if post_dt else None,
-        }
-    except Exception:
-        return None
-
-    return post_dt, post
-
 def dc_fetch():
     """KST 기준 어제 작성 게시글만 수집."""
     session = _make_session()
@@ -259,71 +311,84 @@ def dc_fetch():
 
     req_headers = {"Referer": DC_MAIN_URL}
     target_date = get_target_date()
-    logging.info(f"수집 대상 날짜: {target_date} (KST 기준 어제)")
+    logging.info(f"수집 대상 날짜: {target_date} (KST 어제)")
+    logging.info(f"현재 시각(KST): {datetime.now(KST).isoformat()}")
 
     collected = []
-    stop = False
     last_reason = None
+    total_rows = 0
+    total_fail = 0
 
     for page in range(1, MAX_PAGES_DC + 1):
         rows, reason = _fetch_page_rows(session, page, req_headers)
 
         if rows is None:
             last_reason = reason
-            # 첫 페이지 실패면 치명적, 그 외엔 지금까지 모은 것 반환
             if page == 1:
                 os.environ["DC_FETCH_ERROR"] = reason or "page 1 실패"
                 return []
             logging.warning(f"page {page} 건너뜀: {reason}")
             break
 
-        # 페이지 내 파싱 + 날짜별 카운트
-        page_yesterday_count = 0
-        page_older_count = 0
-        page_newer_count = 0
+        if page == 1:
+            _debug_dump_first_rows(rows, page, n=3)
+
+        page_y = page_o = page_n = page_dnone = 0
 
         for tr in rows:
             parsed = _parse_row(tr)
             if not parsed:
                 continue
             dt, post = parsed
+            total_rows += 1
 
             if dt is None:
-                # 날짜 파싱 실패한 글은 스킵 (공지/비정상 행일 가능성)
+                page_dnone += 1
+                total_fail += 1
                 continue
 
             d = dt.date()
             if d == target_date:
                 collected.append(post)
-                page_yesterday_count += 1
+                page_y += 1
             elif d < target_date:
-                page_older_count += 1
-            else:  # d > target_date (오늘 이후)
-                page_newer_count += 1
+                page_o += 1
+            else:
+                page_n += 1
 
         logging.info(
-            f"[page {page}] 어제={page_yesterday_count} "
-            f"이전={page_older_count} 이후={page_newer_count}"
+            f"[page {page}] 어제={page_y} 이전={page_o} 이후={page_n} 날짜파싱실패={page_dnone}"
         )
 
-        # 중단 조건: 이 페이지에 어제보다 더 이전 글이 하나라도 보이면,
-        # 다음 페이지는 확정적으로 더 오래된 글들이므로 멈춘다.
-        if page_older_count > 0:
-            logging.info(f"어제 이전 글 발견 → 페이지네이션 종료 (page {page})")
-            stop = True
-
-        if stop:
+        # 어제 이전 글이 보이면 종료
+        if page_o > 0:
+            logging.info(f"어제 이전 글 발견 → 종료 (page {page})")
             break
 
-        # 다음 페이지 요청 전 딜레이
+        # 1페이지에서 전혀 파싱 안 되면 종료
+        if page == 1 and page_y == 0 and page_n == 0 and page_dnone > 0:
+            logging.error("page 1 모든 행 날짜 파싱 실패 → 종료")
+            os.environ["DC_FETCH_ERROR"] = (
+                f"날짜 파싱 전부 실패 ({page_dnone}행). "
+                f"Actions 로그의 [DEBUG page 1] 줄을 확인하세요."
+            )
+            return []
+
         time.sleep(REQUEST_INTERVAL_SEC)
 
-    logging.info(f"최종 수집: {len(collected)}건 (대상일 {target_date})")
+    logging.info(
+        f"최종 수집: {len(collected)}건 (대상일 {target_date}, "
+        f"총본행 {total_rows}, 파싱실패 {total_fail})"
+    )
 
-    if not collected and last_reason:
-        os.environ["DC_FETCH_ERROR"] = last_reason
-    elif not collected:
-        os.environ["DC_FETCH_ERROR"] = f"{target_date}에 해당하는 글 없음"
+    if not collected:
+        if last_reason:
+            os.environ["DC_FETCH_ERROR"] = last_reason
+        else:
+            os.environ["DC_FETCH_ERROR"] = (
+                f"{target_date}에 해당하는 글 없음 "
+                f"(총 {total_rows}행 확인, 파싱실패 {total_fail}행)"
+            )
 
     return collected
 
@@ -340,10 +405,6 @@ def build_summary(posts):
             "blocks": [
                 {"type": "section", "text": {"type": "mrkdwn",
                     "text": f":warning: *DC 데이터 수집 실패 ({date_str})*\n사유: `{reason}`"}},
-                {"type": "context", "elements": [
-                    {"type": "mrkdwn",
-                     "text": "러너 네트워크에서 DCInside 접근을 확인하세요 (방화벽, 프록시, 인증서)."}
-                ]},
             ],
         }
 
