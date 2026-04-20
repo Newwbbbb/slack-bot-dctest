@@ -5,6 +5,9 @@
 #  3. 재시도(backoff) + 차단 페이지 감지
 #  4. 진단 로깅 강화 (status, 응답 길이, 본문 일부)
 #  5. 실패 시 Slack에 원인을 함께 전달
+# 회사 SSL 프록시 환경: Python이 Windows 인증서 저장소를 쓰도록 주입
+import truststore
+truststore.inject_into_ssl()
 
 import os
 import re
