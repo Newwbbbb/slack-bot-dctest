@@ -150,7 +150,7 @@ def dc_fetch():
                 time.sleep(BASE_DELAY * attempt + random.random())
                 continue
 
-            soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(r.text, "html.parser")
             rows = soup.select("table.gall_list tbody tr")
             logging.info(f"rows: {len(rows)}")
 
